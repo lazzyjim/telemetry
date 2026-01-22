@@ -1,31 +1,47 @@
 package sink
 
 import (
-	"sync/atomic"
-	"time"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	"telemetry/internal/model"
 )
 
-type RateLimiter struct {
-	maxBytesPerSec int64
-	currentBytes   int64
+type Server struct {
+	buffer      *Buffer
+	rateLimiter *RateLimiter
 }
 
-func NewRateLimiter(maxBytesPerSec int64) *RateLimiter {
-	rl := &RateLimiter{maxBytesPerSec: maxBytesPerSec}
-
-	//reset the counter every second
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			atomic.StoreInt64(&rl.currentBytes, 0)
-		}
-	}()
-	return rl
+func NewServer(buffer *Buffer, rateLimit int64) *Server {
+	return &Server{
+		buffer:      buffer,
+		rateLimiter: NewRateLimiter(rateLimit),
+	}
 }
 
-// return false if limit is exceeded
-func (rl *RateLimiter) TryConsume(n int64) bool {
-	newVal := atomic.AddInt64(&rl.currentBytes, n)
-	return newVal <= rl.maxBytesPerSec
+func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "cannot read body", http.StatusBadRequest)
+		return
+	}
+
+	if !s.rateLimiter.TryConsume(int64(len(data))) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	var msg model.TelemetryMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		fmt.Println("Incorrect message:", string(data))
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	s.buffer.Add(msg)
+
+	fmt.Printf("[%s] Received from %s: %d\n", msg.Timestamp.Format("15:04:05"), msg.SensorName, msg.Value)
+	w.WriteHeader(http.StatusAccepted)
 }
